@@ -5,6 +5,8 @@ import (
 
 	"github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta1"
 	"github.com/linkerd/linkerd2/controller/k8s"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	logging "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,8 +21,14 @@ import (
 type ServerWatcher struct {
 	subscriptions map[podPort][]ServerUpdateListener
 	k8sAPI        *k8s.API
+	metrics       serverMetrics
 	log           *logging.Entry
 	sync.RWMutex
+}
+
+type serverMetrics struct {
+	subscribersGauge prometheus.Gauge
+	portsGauge       prometheus.Gauge
 }
 
 type podPort struct {
@@ -36,11 +44,23 @@ type ServerUpdateListener interface {
 	UpdateProtocol(bool)
 }
 
+var serverMetricsInst = serverMetrics{
+	subscribersGauge: promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "server_subscribers",
+		Help: "Number of subscribers to any Server changes.",
+	}),
+	portsGauge: promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "server_subscribers_port",
+		Help: "Number of pod ports targeted by Server subscribers.",
+	}),
+}
+
 // NewServerWatcher creates a new ServerWatcher.
 func NewServerWatcher(k8sAPI *k8s.API, log *logging.Entry) (*ServerWatcher, error) {
 	sw := &ServerWatcher{
 		subscriptions: make(map[podPort][]ServerUpdateListener),
 		k8sAPI:        k8sAPI,
+		metrics:       serverMetricsInst,
 		log:           log,
 	}
 	_, err := k8sAPI.Srv().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -67,10 +87,11 @@ func (sw *ServerWatcher) Subscribe(pod *corev1.Pod, port Port, listener ServerUp
 	listeners, ok := sw.subscriptions[pp]
 	if !ok {
 		sw.subscriptions[pp] = []ServerUpdateListener{listener}
-		return
+	} else {
+		listeners = append(listeners, listener)
+		sw.subscriptions[pp] = listeners
 	}
-	listeners = append(listeners, listener)
-	sw.subscriptions[pp] = listeners
+	sw.setGauges()
 }
 
 // Unsubscribe unsubcribes a listener from any Server updates.
@@ -100,6 +121,8 @@ func (sw *ServerWatcher) Unsubscribe(pod *corev1.Pod, port Port, listener Server
 	} else {
 		delete(sw.subscriptions, pp)
 	}
+
+	sw.setGauges()
 }
 
 func (sw *ServerWatcher) addServer(obj interface{}) {
@@ -157,4 +180,13 @@ func (sw *ServerWatcher) updateServer(server *v1beta1.Server, selector labels.Se
 			}
 		}
 	}
+}
+
+func (sw *ServerWatcher) setGauges() {
+	subscribers := 0
+	for _, v := range sw.subscriptions {
+		subscribers += len(v)
+	}
+	sw.metrics.subscribersGauge.Set(float64(subscribers))
+	sw.metrics.portsGauge.Set(float64(len(sw.subscriptions)))
 }
